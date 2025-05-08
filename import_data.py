@@ -134,23 +134,43 @@ def process_properties(row: Dict[str, Any]) -> Dict[str, Any]:
         "upload_sources": parse_array(row.get("upload_sources", "")),
         "last_updated": datetime.now(timezone.utc)
     }
-
 def process_owners(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Owner processor with enhanced field handling"""
+    """Process owner record with phone number handling and validation"""
+    # Validate required fields
+    required_fields = ['apn', 'full_name']
+    for field in required_fields:
+        if not row.get(field):
+            raise ValueError(f"Missing required field: {field}")
+
+    # Clean and validate core fields
+    cleaned_apn = clean_apn(row["apn"])
+    if not cleaned_apn:
+        raise ValueError("Invalid APN format")
+
+    # Process phone numbers
+    raw_phones = row.get("phone", "")
+    phone_numbers = []
+    for num in str(raw_phones).split(';'):
+        cleaned_num = clean_phone(num.strip())
+        if cleaned_num:
+            phone_numbers.append(cleaned_num)
+
     return {
-        "apn": clean_apn(row.get("apn", "")),
-        "full_name": str(row.get("full_name", "")).strip(),
+        "apn": cleaned_apn,
+        "full_name": str(row["full_name"]).strip(),
         "first_name": str(row.get("first_name", "")).strip(),
         "last_name": str(row.get("last_name", "")).strip(),
         "mailing_street": str(row.get("mailing_street", "")).strip(),
         "mailing_city": str(row.get("mailing_city", "")).strip(),
         "mailing_state": str(row.get("mailing_state", "")).strip().upper()[:2],
-        "mailing_zip": validate_zip(row.get("mailing_zip", "").strip()[:10]),
-        "emails": parse_array(row.get("emails", [])),
-        "upload_sources": parse_array(row.get("upload_sources", ["legacy"])),
-        "last_updated": datetime.now(timezone.utc)
+        "mailing_zip": validate_zip(str(row.get("mailing_zip", "")).strip()[:10]),
+        "emails": parse_array(row.get("emails", "")),
+        "phone_numbers": phone_numbers,  # Store cleaned numbers
+        "upload_sources": parse_array(row.get("upload_sources", "legacy")),
+        "last_updated": datetime.now(timezone.utc),
+        # Temporary field for phone relationships
+        "_phone_links": [{"number": num, "owner_apn": cleaned_apn} for num in phone_numbers]
     }
-
 
 # For phones
 def process_phones(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -175,6 +195,7 @@ def process_phones(row: Dict[str, Any]) -> Dict[str, Any]:
         "tags": parse_array(row.get("tags", [])),
         "last_updated": datetime.now(timezone.utc)
     }
+    
 
 def process_life_events(row: Dict[str, Any]) -> Dict[str, Any]:
     """Life event processor with null handling and validation"""
