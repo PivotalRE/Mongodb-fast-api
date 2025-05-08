@@ -748,6 +748,21 @@ def download_errors_csv(session_id: str, db=Depends(get_db)):
     output.seek(0)
     return StreamingResponse(output, media_type="text/csv")
 
+
+@app.get("/", tags=["System"])
+def root():
+    return {
+        "message": "Welcome to the Unified Real Estate Data API.",
+        "version": "1.0.0",
+        "endpoints": {
+            "upload": "/upload/unified",
+            "status": "/upload/sessions/{session_id}",
+            "requirements": "/upload/requirements/unified",
+            "property lookup": "/properties/{apn}"
+        },
+        "docs": "/docs"
+    }
+
 # --- Index Management ---
 @app.on_event("startup")
 async def startup_db_client():
