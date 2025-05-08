@@ -330,19 +330,20 @@ def process_unified_batch(batch: List[Dict], db):
     
     for row in batch:
         try:
-            entities = process_unified_row(row)
+            row_number = row.get("row_number", -1)
+            raw_data = row.get("data", {})
+
+            entities = process_unified_row(raw_data)
 
             if not entities:
                 continue
 
             if "error" in entities:
-                errors.append({
-                    "row": row.get("row_number", -1),
-                    "error_type": entities["error"]["error_type"],
-                    "message": entities["error"]["message"],
-                    "raw_data": entities["error"]["raw_data"]
-                })
+                entities["error"]["row_number"] = row_number  # inject the row number here
+                errors.append(entities["error"])
+                logger.warning(f"[Row {row_number}] Skipped: {entities['error']['message']}")
                 continue
+
 
             # Now safe to access: entities["property"], entities["owner"], etc.
             prop_ops.append(UpdateOne(
