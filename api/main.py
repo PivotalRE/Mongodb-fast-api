@@ -248,7 +248,7 @@ def process_unified_row(row: Dict) -> Optional[Dict]:
 
         phone_docs = []
         for i in range(1, 31):
-            phone = mapped_row.get(f"phone {i}", "")
+            phone = processed_row.get(f"phone {i}", "")
             if not phone:
                 continue
             phone_number = clean_phone(phone)
