@@ -14,10 +14,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from starlette import status
 from pymongo import MongoClient, UpdateOne, InsertOne
+import pymongo
 from pymongo.errors import BulkWriteError
 from dotenv import load_dotenv
 from bson import json_util
 import json
+import phonenumbers # type: ignore
+from email_validator import validate_email, EmailNotValidError
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -122,15 +125,22 @@ def clean_apn(raw_apn: str) -> Optional[str]:
     return cleaned if len(cleaned) >= 5 else None
 
 def clean_phone(phone: str) -> Optional[str]:
-    if not phone:
+    try:
+        parsed = phonenumbers.parse(phone, "US")
+        if phonenumbers.is_valid_number(parsed):
+            formatted = phonenumbers.format_number(
+                parsed, 
+                phonenumbers.PhoneNumberFormat.E164
+            ).replace("+1", "")
+            logger.debug(f"Cleaned phone: {phone} → {formatted}")
+            return formatted
+        else:
+            logger.warning(f"Invalid phone number (not valid): {phone}")
+            return None
+    except phonenumbers.NumberParseException as e:
+        logger.warning(f"Failed to parse phone {phone}: {str(e)}")
         return None
-    cleaned = re.sub(r"[^0-9]", "", str(phone).strip())
-    if len(cleaned) == 10:
-        return cleaned
-    elif len(cleaned) == 11 and cleaned.startswith("1"):
-        return cleaned[1:]  # Strip US country code
-    logger.warning(f"Invalid phone format: {phone}")
-    return None
+
 def validate_zip(zip_code: str) -> Optional[str]:
     cleaned = re.sub(r"[^0-9]", "", str(zip_code).strip())
     return cleaned if len(cleaned) in [5, 9] else None
@@ -223,10 +233,13 @@ def process_unified_row(row: Dict) -> Optional[Dict]:
         emails = []
         for i in range(1, 11):
             email = processed_row.get(f"email {i}", "").strip()
-            if email and re.match(r"[^@]+@[^@]+\.[^@]+", email):
-                emails.append(email.lower())
-            elif email:
-                logger.warning(f"Invalid email format: {email}")
+            if email:
+                try:
+                    parsed = validate_email(email, check_deliverability=False)
+                    emails.append(parsed.normalized)
+                except EmailNotValidError:
+                    logger.warning(f"Invalid email format: {email}")
+
 
         owner_doc = {
             "owner_id": owner_id,
@@ -254,19 +267,20 @@ def process_unified_row(row: Dict) -> Optional[Dict]:
             phone_number = clean_phone(phone)
             if phone_number:
                 logger.info(f"[Phone Found] {phone_number} from column: phone {i}")
-                # Generate deterministic phone_id based on the phone number
                 phone_id_hash = hashlib.sha256(phone_number.encode()).hexdigest()[:8]
                 phone_id = f"PHONE-{phone_id_hash}"
-                phone_docs.append({
+                phone_doc = {
                     "phone_id": phone_id,
-                    "number": phone_number,
+                    "number": str(phone_number),
+                    "linked_apns": [apn],
+                    "linked_owners": [owner_id], 
                     "type": mapped_row.get(f"phone type {i}", "UNKNOWN").upper(),
                     "status": mapped_row.get(f"phone status {i}", "UNVERIFIED").upper(),
                     "tags": parse_array(mapped_row.get(f"phone tags {i}", "")),
-                    "linked_apns": [apn],
-                    "linked_owners": [owner_id],
                     "last_updated": datetime.now(timezone.utc)
-                })
+                }
+                logger.debug(f"Phone document prepared: {json.dumps(phone_doc, default=str)}")  # <-- NEW
+                phone_docs.append(phone_doc)
                 owner_doc["phone_ids"].append(phone_id)
 
 
@@ -362,8 +376,7 @@ def process_unified_batch(batch: List[Dict], db):
                     "mailing_address": entities["owner"]["mailing_address"]
                 },
                 "$addToSet": {
-                    "emails": {"$each": entities["owner"]["emails"]},  # Add this line
-                    "phone_ids": {"$each": entities["owner"]["phone_ids"]},
+                    "emails": {"$each": entities["owner"]["emails"]},
                     "tags": {"$each": entities["owner"]["tags"]}
                 },
                 "$set": {
@@ -372,11 +385,9 @@ def process_unified_batch(batch: List[Dict], db):
                 }
             }
 
-            # Only include $addToSet if phone_ids is not empty to avoid MongoDB write conflict
+            # Add phone_ids to $addToSet without overwriting other fields
             if entities["owner"]["phone_ids"]:
-                owner_update["$addToSet"] = {
-                    "phone_ids": {"$each": entities["owner"]["phone_ids"]}
-                }
+                owner_update["$addToSet"]["phone_ids"] = {"$each": entities["owner"]["phone_ids"]}
 
             owner_ops.append(UpdateOne(
                 {"normalized_owner_id": entities["owner"]["normalized_owner_id"]},
@@ -401,32 +412,36 @@ def process_unified_batch(batch: List[Dict], db):
 
             # Phone updates
             for phone in entities["phones"]:
+                if not all(key in phone for key in ["phone_id", "number"]):
+                    logger.error(f"Invalid phone document: {phone}")
+                    continue  # Skip invalid entries
+
                 logger.info(f"[Mongo Upsert] Inserting phone: {phone['number']} (ID: {phone['phone_id']})")
                 phone_ops.append(UpdateOne(
-                    {"number": phone["number"]},
+                    {"number": str(phone["number"])},
                     {
+                        # Initialize fields only on insert
                         "$setOnInsert": {
                             "phone_id": phone["phone_id"],
-                            "number": phone["number"],
+                            "number": str(phone["number"]),
                             "type": phone["type"],
                             "status": phone["status"],
                             "tags": phone.get("tags", []),
-                            "linked_apns": phone["linked_apns"],
-                            "linked_owners": phone["linked_owners"],
-                            "last_updated": phone["last_updated"]
+                            "created_at": phone["last_updated"]
                         },
-                        "$addToSet": {
-                            "linked_apns": {"$each": phone["linked_apns"]},
-                            "linked_owners": {"$each": phone["linked_owners"]}
-                        },
+
+                        # Always update these fields
                         "$set": {
                             "last_updated": phone["last_updated"]
+                        },
+                        # Safely merge arrays (works even if existing fields are invalid)
+                        "$addToSet": {
+                            "linked_apns": { "$each": phone["linked_apns"] },
+                            "linked_owners": { "$each": phone["linked_owners"] }
                         }
                     },
                     upsert=True
                 ))
-
-
             
             # Life events
             for event in entities["life_events"]:
@@ -449,7 +464,17 @@ def process_unified_batch(batch: List[Dict], db):
         if owner_ops:
             results["owners"] = db.owners.bulk_write(owner_ops).bulk_api_result
         if phone_ops:
-            results["phones"] = db.phones.bulk_write(phone_ops).bulk_api_result
+            try:
+                bulk_result = db.phones.bulk_write(phone_ops)
+                logger.info(
+                    f"PHONE BULK WRITE RESULT:\n"
+                    f"Inserted: {bulk_result.inserted_count}\n"
+                    f"Updated: {bulk_result.modified_count}\n"
+                    f"Upserts: {len(bulk_result.upserted_ids)}"
+                )
+                results["phones"] = bulk_result.bulk_api_result
+            except BulkWriteError as bwe:
+                logger.error(f"PHONE WRITE FAILURE: {str(bwe)}")
         if life_event_ops:
             results["life_events"] = db.life_events.bulk_write(life_event_ops).bulk_api_result
     except BulkWriteError as bwe:
@@ -729,25 +754,36 @@ def get_upload_summary_report(session_id: str, format: str = "json", db=Depends(
     return report
 
 
-@app.get("/upload/sessions/{session_id}/errors.csv", tags=["Reporting"])
-def download_errors_csv(session_id: str, db=Depends(get_db)):
+@app.get("/upload/sessions/{session_id}/error_rows.csv", tags=["Reporting"])
+def download_error_rows_csv(session_id: str, db=Depends(get_db)):
     session = db.upload_sessions.find_one({"upload_id": session_id})
     if not session or "errors" not in session:
-        raise HTTPException(status_code=404, detail="No errors for this session")
+        raise HTTPException(404, "No errors found")
 
-    import io, csv
+    # Get all error rows
+    all_errors = session["errors"][:1000]  # Adjust based on your storage limit
+    
+    # Extract CSV headers
+    fieldnames = set()
+    for error in all_errors:
+        fieldnames.update(error["raw_data"].keys())
+
+    # Generate CSV
     output = io.StringIO()
-    keys = ["row", "error_type", "message"]
-    writer = csv.DictWriter(output, fieldnames=keys)
+    writer = csv.DictWriter(output, fieldnames=sorted(fieldnames))
     writer.writeheader()
-    for err in session["errors"]:
+    
+    for error in all_errors:
         writer.writerow({
-            "row": err.get("row"),
-            "error_type": err.get("error_type", "unknown"),
-            "message": err.get("message", str(err.get("error", "")))
+            k: str(v) for k, v in error["raw_data"].items()
         })
+    
     output.seek(0)
-    return StreamingResponse(output, media_type="text/csv")
+    return StreamingResponse(
+        output,
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=errors_{session_id}.csv"}
+    )
 
 
 @app.get("/", tags=["System"])
@@ -782,8 +818,13 @@ async def startup_db_client():
         db.properties.create_index([("address.zip", 1)], background=True)
         db.owners.create_index([("apn", 1)], background=True)
         db.owners.create_index([("phone_ids", 1)], background=True)
-        db.phones.create_index([("number", 1)], unique=True, background=True)
-        db.phones.create_index([("linked_apns", 1)], background=True)
+        db.phones.create_index(
+            [("number", pymongo.ASCENDING)],
+            name="number_unique_ci",
+            unique=True,
+            collation={"locale": "en", "strength": 2},  # Case-insensitive
+            background=True
+        )
         db.life_events.create_index([("apn", 1)], background=True)
 
         logger.info("Database connection established and indexes verified")
