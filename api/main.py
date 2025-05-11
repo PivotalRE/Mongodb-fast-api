@@ -21,6 +21,7 @@ from bson import json_util
 import json
 import phonenumbers # type: ignore
 from email_validator import validate_email, EmailNotValidError
+from dateutil.parser import parse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -283,21 +284,145 @@ def process_unified_row(row: Dict) -> Optional[Dict]:
                 phone_docs.append(phone_doc)
                 owner_doc["phone_ids"].append(phone_id)
 
+                # ========== LIFE EVENTS PROCESSING ==========
+        known_life_event_fields = {
+            # Tax Events
+            "tax auction date": "TAX_AUCTION",
+            "tax delinquent value": "TAX_DELINQUENCY",
+            "tax delinquent year": "TAX_DELINQUENCY",
+            "year behind on taxes": "TAX_DELINQUENCY",
+            
+            # Legal Events
+            "lien type": "LIEN",
+            "lien recording date": "LIEN",
+            "foreclosure date": "FORECLOSURE",
+            "bankruptcy recording date": "BANKRUPTCY",
+            "divorce file date": "DIVORCE",
+            
+            # Probate/Inheritance
+            "probate open date": "PROBATE",
+            "personal representative": "PROBATE",
+            "attorney on file": "PROBATE",
+            
+            # Property Events
+            "deed": "DEED_CHANGE",
+            "last sold": "PROPERTY_SALE",
+            "owned since": "OWNERSHIP_DURATION",
+        }
+
+        TAG_EVENT_PATTERNS = {
+            r"skip traced (\w+) (\d{2}/\d{4})": "SKIP_TRACED",
+            r"list purchased (\w+) (\d{2}/\d{4})": "LIST_PURCHASED",
+            r"readymode (\d{2}/\d{4})": "READYMODE_UPDATE",
+            r"original owner": "ORIGINAL_OWNER",
+            r"vacant": "VACANT_HOME",
+            r"poor/fair condition": "POOR_CONDITION",
+            r"probate": "PROBATE",
+            r"quit claim": "QUIT_CLAIM_DEED"
+        }
 
         life_events = []
-        tax_year = mapped_row.get("tax delinquent year", "")
-        tax_value = mapped_row.get("tax delinquent value", "")
-        if tax_year and tax_value:
-            try:
+        tags = owner_doc.get("tags", [])  # Get parsed tags array
+
+        # Process structured fields
+        for field, event_type in known_life_event_fields.items():
+            raw_value = mapped_row.get(field, "").strip()
+            if not raw_value:
+                continue
+
+            event = {
+                "apn": apn,
+                "event_type": event_type,
+                "source": "CSV Field",
+                "source_detail": field,
+                "event_date": None,
+                "notification_date": datetime.now(timezone.utc),
+                "last_updated": datetime.now(timezone.utc)
+            }
+
+            # Date parsing
+            if any(kw in field.lower() for kw in ["date", "year", "since"]):
+                try:
+                    if re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", raw_value):
+                        event["event_date"] = datetime.strptime(raw_value, "%Y-%m-%d %H:%M:%S")
+                    elif re.match(r"\d{2}/\d{4}", raw_value):
+                        event["event_date"] = datetime.strptime(f"01/{raw_value}", "%d/%m/%Y")
+                    else:
+                        event["event_date"] = parse(raw_value)
+                except Exception as e:
+                    logger.warning(f"Failed to parse date for {field}: {str(e)}")
+
+            life_events.append(event)
+
+        # Process tags for life events
+        sale_reasons = []
+        for tag in tags:
+            tag_lower = tag.lower()
+            
+            # Pattern-based events
+            for pattern, event_type in TAG_EVENT_PATTERNS.items():
+                if re.search(pattern, tag_lower):
+                    event = {
+                        "apn": apn,
+                        "event_type": event_type,
+                        "source": "Tag",
+                        "source_detail": tag,
+                        "notification_date": datetime.now(timezone.utc),
+                        "last_updated": datetime.now(timezone.utc)
+                    }
+                    
+                    # Extract date from tag
+                    date_match = re.search(r"(\d{2}/\d{4})", tag)
+                    if date_match:
+                        try:
+                            event["event_date"] = datetime.strptime(
+                                f"01/{date_match.group(1)}", "%d/%m/%Y"
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to parse date from tag: {tag} - {str(e)}")
+                    
+                    life_events.append(event)
+                    break  # Stop checking patterns after first match
+
+            # Sale reason detection
+            if "tired landlords" in tag_lower:
+                sale_reasons.append("TIRED_LANDLORD")
+            if "empty nesters" in tag_lower:
+                sale_reasons.append("EMPTY_NESTERS")
+            if "high equity" in tag_lower:
+                sale_reasons.append("HIGH_EQUITY")
+
+            # Physical distress detection
+            if any(indicator in tag_lower for indicator in ["poor condition", "fair condition"]):
                 life_events.append({
-                    "event_type": "TAX_DELINQUENCY",
-                    "date": datetime(int(tax_year), 1, 1),
-                    "amount": safe_float(tax_value),
-                    "description": f"Tax delinquent since {tax_year}",
+                    "apn": apn,
+                    "event_type": "PHYSICAL_DISTRESS",
+                    "source": "Tag Analysis",
+                    "notification_date": datetime.now(timezone.utc),
                     "last_updated": datetime.now(timezone.utc)
                 })
-            except ValueError:
-                pass
+
+        # Add aggregated sale reasons
+        if sale_reasons:
+            life_events.append({
+                "apn": apn,
+                "event_type": "SALE_REASON",
+                "source": "Tag Analysis",
+                "details": sale_reasons,
+                "notification_date": datetime.now(timezone.utc),
+                "last_updated": datetime.now(timezone.utc)
+            })
+
+        # Add physical distress detection
+        if any(indicator in tags for indicator in ["poor condition", "fair condition"]):
+            life_events.append({
+                "apn": apn,
+                "event_type": "PHYSICAL_DISTRESS",
+                "source": "Tag Analysis",
+                "notification_date": datetime.now(timezone.utc),
+                "last_updated": datetime.now(timezone.utc)
+            })
+
 
         last_sold = mapped_row.get("last sold", "")
         sale_price = mapped_row.get("last sale price", "")
@@ -445,14 +570,29 @@ def process_unified_batch(batch: List[Dict], db):
             
             # Life events
             for event in entities["life_events"]:
-                if event["event_type"] == "SALE":
-                    continue 
                 life_event_ops.append(UpdateOne(
-                    {"apn": entities["property"]["apn"], "event_type": event["event_type"]},
-                    {"$set": event},
+                    {
+                        "apn": event["apn"],
+                        "event_type": event["event_type"],
+                        "source_detail": event["source_detail"]
+                    },
+                    {
+                        "$setOnInsert": {
+                            "created_at": datetime.now(timezone.utc)
+                        },
+                        "$set": {
+                            "event_date": event.get("event_date"),
+                            "notification_date": event["notification_date"],
+                            "last_updated": event["last_updated"],
+                            "source": event["source"]
+                        },
+                        "$addToSet": {
+                            "related_tags": {"$each": [event["source_detail"]]}
+                        }
+                    },
                     upsert=True
                 ))
-                
+
         except Exception as e:
             logger.error(f"Batch processing error: {str(e)}")
     
@@ -476,7 +616,11 @@ def process_unified_batch(batch: List[Dict], db):
             except BulkWriteError as bwe:
                 logger.error(f"PHONE WRITE FAILURE: {str(bwe)}")
         if life_event_ops:
-            results["life_events"] = db.life_events.bulk_write(life_event_ops).bulk_api_result
+            try:
+                result = db.life_events.bulk_write(life_event_ops)
+                logger.info(f"LifeEvents: Inserted={result.inserted_count}, Updated={result.modified_count}")
+            except BulkWriteError as bwe:
+                logger.error(f"LifeEvents Write Error: {json.dumps(bwe.details, indent=2)}")
     except BulkWriteError as bwe:
         logger.error(f"Bulk write error: {bwe.details}")
         results["errors"] = bwe.details
@@ -825,7 +969,8 @@ async def startup_db_client():
             collation={"locale": "en", "strength": 2},  # Case-insensitive
             background=True
         )
-        db.life_events.create_index([("apn", 1)], background=True)
+        db.life_events.create_index([("apn", 1), ("event_type", 1)])
+        db.life_events.create_index([("event_date", -1)])
 
         logger.info("Database connection established and indexes verified")
         
