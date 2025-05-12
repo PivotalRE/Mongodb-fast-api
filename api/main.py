@@ -6,6 +6,7 @@ import csv
 import io
 import re
 import hashlib
+import math
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 
@@ -40,7 +41,7 @@ API_KEY_NAME = "X-API-KEY"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
 
 REQUIRED_COLUMN_MAPPINGS = {
-    "apn": ["apn", "parcel id", "parcel number"],
+    "apn": ["apn"],
     "first name": ["first name", "owner.first_name", "owner first name", "first", "firstname"],
     "last name": ["last name", "owner.last_name", "owner last name", "last", "lastname"],
     "property address": ["property address", "address.street", "address street", "street"]
@@ -104,26 +105,35 @@ def normalize_column_name(col: str) -> str:
 
 
 def clean_apn(raw_apn: str) -> Optional[str]:
-    """More robust APN cleaning with better validation"""
-    if not raw_apn:
+    """
+    Cleans and validates APN.
+    A valid APN must become purely numeric after removing non-digit characters.
+    Length does NOT matter, only that it is numeric-only.
+    """
+    if not raw_apn or not isinstance(raw_apn, str):
         return None
+
+    # Remove hyphens and any non-digit characters
+    cleaned = re.sub(r"[^\d]", "", raw_apn.strip())
+
+    if not cleaned:
         return None
-        
-    # Remove all non-alphanumeric chars except hyphens
-    cleaned = re.sub(r"[^\w-]", "", str(raw_apn).upper().strip())
-    
-    # Handle common placeholder values
-    if cleaned in ["N/A", "NA", "NULL", "MISSING"]:
+
+    # Final validation: Must be all digits
+    if not cleaned.isdigit():
         return None
-        
-    # Pad numeric APNs with leading zeros if needed
-    if cleaned.isdigit():
-        if len(cleaned) < 5:
-            return None  # Reject clearly invalid numeric APNs
-        if 5 <= len(cleaned) < 12:
-            return cleaned.zfill(12)  # Standardize to 12 digits
-            
-    return cleaned if len(cleaned) >= 5 else None
+
+    return cleaned
+
+
+
+def is_invalid_apn(apn_val):
+    if apn_val is None:
+        return True
+    if isinstance(apn_val, float) and math.isnan(apn_val):  # for pandas/numpy NaNs
+        return True
+    apn_str = str(apn_val).strip().lower()
+    return apn_str in {'', 'n/a', 'none', 'nan'}
 
 def clean_phone(phone: str) -> Optional[str]:
     try:
@@ -160,17 +170,21 @@ def parse_array(value: str) -> List[str]:
 
 def map_column(column_name: str, mappings: Dict[str, List[str]]) -> Optional[str]:
     normalized = normalize_column_name(column_name)
+    
+    # Check if already a canonical name
+    if normalized in mappings:
+        return normalized
+    
     for canonical, aliases in mappings.items():
         if any(normalize_column_name(alias) == normalized for alias in aliases):
             return canonical
     return None
-
 def generate_owner_hash(first_name: str, last_name: str, mailing_address: str, zip_code: str) -> str:
     raw = f"{first_name.lower().strip()}_{last_name.lower().strip()}_{mailing_address.lower().strip()}_{zip_code}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 # ------------------- Row Processing -------------------
-def process_unified_row(row: Dict) -> Optional[Dict]:
+def process_unified_row(row: Dict, db) -> Optional[Dict]:
     try:
         processed_row = {
             normalize_column_name(k): str(v).strip() if v is not None else ""
@@ -181,22 +195,27 @@ def process_unified_row(row: Dict) -> Optional[Dict]:
         for col_name, value in processed_row.items():
             canonical = map_column(col_name, REQUIRED_COLUMN_MAPPINGS) or \
                        map_column(col_name, OPTIONAL_COLUMN_MAPPINGS)
+            logger.debug(f"Original row: {row}")
+            logger.debug(f"Processed row: {processed_row}")
+            logger.debug(f"Mapped row: {mapped_row}")
+
             if canonical:
                 mapped_row[canonical] = value
 
         apn = clean_apn(mapped_row.get("apn", ""))
-        
-        
-        if not apn:
-            error_msg = f"Missing or invalid APN: raw = '{mapped_row.get('apn', '')}'"
-            logger.warning(f"Skipping row with missing/invalid APN: raw = '{mapped_row.get('apn', '')}'")
-            return {
-                "error": {
-                    "error_type": "validation_error",
-                    "message": error_msg,
-                    "raw_data": row
-                }
+        if apn is None:
+            logger.warning(f"[Fallback] Invalid APN: {mapped_row.get('apn')}")
+            fallback_doc = {
+                "raw_data": row,
+                "reason": "missing_or_invalid_apn",
+                "status": "pending",
+                "created_at": datetime.now(timezone.utc),
+                "source": "unified_csv"
             }
+            db.fallback_candidates.insert_one(fallback_doc)
+            return None
+
+
 
 
         if mapped_row.get("property state", "").strip().upper() != "WA":
@@ -472,7 +491,7 @@ def process_unified_batch(batch: List[Dict], db):
             row_number = row.get("row_number", -1)
             raw_data = row.get("data", {})
 
-            entities = process_unified_row(raw_data)
+            entities = process_unified_row(raw_data, db)
 
             if not entities:
                 continue
@@ -654,10 +673,14 @@ async def upload_unified_csv(
         logger.info(f"Normalized columns received: {received_columns}")
 
         for canonical, aliases in REQUIRED_COLUMN_MAPPINGS.items():
-            found = any(
-                normalize_column_name(alias) in received_columns
-                for alias in aliases
-            )
+            if canonical == "apn":
+                found = "apn" in received_columns  # Only accept actual "apn"
+            else:
+                found = any(
+                    normalize_column_name(alias) in received_columns
+                    for alias in aliases
+                )
+
             
             if not found:
                 missing_fields[canonical] = {
@@ -971,6 +994,15 @@ async def startup_db_client():
         )
         db.life_events.create_index([("apn", 1), ("event_type", 1)])
         db.life_events.create_index([("event_date", -1)])
+        
+                # --- NEW: fallback_candidates setup ---
+        if "fallback_candidates" not in db.list_collection_names():
+            db.create_collection("fallback_candidates")
+            logger.info("Created 'fallback_candidates' collection.")
+
+        db.fallback_candidates.create_index([("status", 1)], background=True)
+        db.fallback_candidates.create_index([("reason", 1)], background=True)
+        db.fallback_candidates.create_index([("created_at", -1)], background=True)
 
         logger.info("Database connection established and indexes verified")
         
