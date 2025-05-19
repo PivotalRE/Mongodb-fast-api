@@ -33,7 +33,9 @@ from email_validator import validate_email, EmailNotValidError # type: ignore
 import requests
 import phonenumbers     # type: ignore
 
-from utils.selenium_google import get_parcel_number
+# from utils.selenium_google import get_parcel_number
+from api.utils.selenium_google import get_parcel_number
+
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
