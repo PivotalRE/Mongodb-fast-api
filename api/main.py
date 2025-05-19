@@ -1,28 +1,39 @@
-import sys
-import logging
 import os
-import uuid
+import sys
 import csv
 import io
 import re
-import hashlib
+import json
 import math
+import uuid
+import hashlib
+import logging
+import time
+import random
+import urllib.parse
 from datetime import datetime, timezone
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from starlette import status
-from pymongo import MongoClient, UpdateOne, InsertOne
-import pymongo
+
+from pymongo import MongoClient, UpdateOne
+from pymongo.database import Database
 from pymongo.errors import BulkWriteError
+import pymongo
+
+from bson import ObjectId, json_util
 from dotenv import load_dotenv
-from bson import json_util
-import json
-import phonenumbers # type: ignore
-from email_validator import validate_email, EmailNotValidError
+
+from rapidfuzz import fuzz # type: ignore
 from dateutil.parser import parse
+from email_validator import validate_email, EmailNotValidError # type: ignore
+import requests
+import phonenumbers     # type: ignore
+
+from utils.selenium_google import get_parcel_number
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -48,7 +59,6 @@ REQUIRED_COLUMN_MAPPINGS = {
 }
 
 OPTIONAL_COLUMN_MAPPINGS = {
-    # Property
     "property city": ["property city", "address.city"],
     "property state": ["property state", "address.state"],
     "property zip": ["property zip", "address.zip"],
@@ -59,28 +69,16 @@ OPTIONAL_COLUMN_MAPPINGS = {
     "estimated value": ["estimated value"],
     "last sale price": ["last sale price"],
     "last sold": ["last sold"],
-
-    # Mailing
     "mailing address": ["mailing address"],
     "mailing city": ["mailing city"],
     "mailing state": ["mailing state"],
     "mailing zip": ["mailing zip", "mailing zip5"],
-
-    # Owner & contact
     "status": ["status"],
     "tags": ["tags"],
-
-    # Emails
     "email 1": [f"email {i}" for i in range(1, 11)],
-
-    # Phone support already dynamically handled in your loop
-
-    # Life events
     "tax delinquent year": ["tax delinquent year"],
     "tax delinquent value": ["tax delinquent value"]
 }
-
-
 
 def get_db():
     return app.state.db
@@ -92,45 +90,23 @@ def normalize_column_name(col: str) -> str:
         col.strip().lower()
         .replace('_', ' ').replace('.', ' ').replace('-', ' ')
     )
-    # Collapse extra spaces
     normalized = re.sub(r'\s+', ' ', normalized)
-    # Add space between word and number (e.g., 'phone1' → 'phone 1')
     normalized = re.sub(r'([a-zA-Z])(\d+)', r'\1 \2', normalized)
-    
-    # Special case aliases
     normalized = normalized.replace("address street", "property address")
     normalized = normalized.replace("owner first name", "first name")
     normalized = normalized.replace("owner last name", "last name")
     return normalized
 
-
 def clean_apn(raw_apn: str) -> Optional[str]:
-    """
-    Cleans and validates APN.
-    A valid APN must become purely numeric after removing non-digit characters.
-    Length does NOT matter, only that it is numeric-only.
-    """
-    if not raw_apn or not isinstance(raw_apn, str):
-        return None
-
-    # Remove hyphens and any non-digit characters
-    cleaned = re.sub(r"[^\d]", "", raw_apn.strip())
-
-    if not cleaned:
-        return None
-
-    # Final validation: Must be all digits
+    cleaned = re.sub(r"[^\d]", "", str(raw_apn).strip())
     if not cleaned.isdigit():
         return None
-
-    return cleaned
-
-
+    return cleaned.zfill(10)
 
 def is_invalid_apn(apn_val):
     if apn_val is None:
         return True
-    if isinstance(apn_val, float) and math.isnan(apn_val):  # for pandas/numpy NaNs
+    if isinstance(apn_val, float) and math.isnan(apn_val):
         return True
     apn_str = str(apn_val).strip().lower()
     return apn_str in {'', 'n/a', 'none', 'nan'}
@@ -154,7 +130,21 @@ def clean_phone(phone: str) -> Optional[str]:
 
 def validate_zip(zip_code: str) -> Optional[str]:
     cleaned = re.sub(r"[^0-9]", "", str(zip_code).strip())
-    return cleaned if len(cleaned) in [5, 9] else None
+    return cleaned if len(cleaned) == 5 else None
+
+def extract_best_zip(row: Dict[str, str], zip_keys: List[str]) -> Optional[str]:
+    for key in zip_keys:
+        zip_val = row.get(key)
+        if not zip_val:
+            continue
+        direct_clean = validate_zip(zip_val)
+        if direct_clean:
+            return direct_clean
+        if "-" in zip_val:
+            base_zip = zip_val.split("-")[0]
+            if validate_zip(base_zip):
+                return base_zip
+    return None
 
 def safe_int(value: Any) -> Optional[int]:
     try: return int(float(value)) if value not in [None, ""] else None
@@ -170,73 +160,166 @@ def parse_array(value: str) -> List[str]:
 
 def map_column(column_name: str, mappings: Dict[str, List[str]]) -> Optional[str]:
     normalized = normalize_column_name(column_name)
-    
-    # Check if already a canonical name
     if normalized in mappings:
         return normalized
-    
     for canonical, aliases in mappings.items():
         if any(normalize_column_name(alias) == normalized for alias in aliases):
             return canonical
     return None
+
 def generate_owner_hash(first_name: str, last_name: str, mailing_address: str, zip_code: str) -> str:
     raw = f"{first_name.lower().strip()}_{last_name.lower().strip()}_{mailing_address.lower().strip()}_{zip_code}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
+def find_best_db_match(address, name, db):
+    candidates = db.properties.find({"address.street": {"$exists": True}})
+    best_match = None
+    best_score = 0
+    for prop in candidates:
+        addr_similarity = fuzz.ratio(address, prop["address"].get("street", ""))
+        owner_full_name = ""
+        if prop.get("owner") and "full_name" in prop["owner"]:
+            owner_full_name = prop["owner"]["full_name"]
+        name_similarity = fuzz.ratio(name, owner_full_name)
+        total_score = (addr_similarity * 0.8) + (name_similarity * 0.2)
+        if total_score > best_score:
+            best_score = total_score
+            best_match = prop
+    return best_match, best_score
+
+def standardize_address(raw_address: str, city: str, state: str, zip_code: str) -> Dict[str, str]:
+    street = re.sub(r'\s+', ' ', raw_address.strip().upper())
+    city = city.strip().upper() if city else ''
+    state = state.strip().upper()[:2] if state else ''
+    zip_code = validate_zip(zip_code) or ''
+    return {
+        "street": street,
+        "city": city,
+        "state": state,
+        "zip": zip_code
+    }
+
+def apify_general_scrape(address: str, apify_token: str) -> Optional[str]:
+    try:
+        payload = {
+            "startUrls": [{"url": f"https://www.google.com/search?q={urllib.parse.quote_plus(address + ' parcel number')}"}],
+            "maxDepth": 2,
+            "maxPagesPerCrawl": 5
+        }
+        response = requests.post(
+            "https://api.apify.com/v2/acts/apify~web-scraper/run-sync-get-dataset-items",
+            params={"token": apify_token},
+            json=payload,
+            timeout=60
+        )
+        response.raise_for_status()
+        data = response.json()
+        for item in data:
+            text = item.get("text", "")
+            apn_match = re.search(r'\b\d{10}\b|\b\d{3}-\d{3}-\d{3}\b', text)
+            if apn_match:
+                apn = apn_match.group(0).replace("-", "")
+                logger.info(f"Apify found APN: {apn}")
+                return apn
+        logger.warning(f"No APN found in Apify scrape for {address}")
+        return None
+    except requests.RequestException as e:
+        logger.error(f"Apify scrape failed for {address}: {str(e)}")
+        return None
+
+def move_out_of_fallback(apn: str, raw_data: Dict, db, candidate_id):
+    raw_data["apn"] = apn
+    processed = process_unified_row(raw_data, db)
+    if processed:
+        process_unified_batch([{"row_number": -1, "data": raw_data}], db)
+        db.fallback_candidates.delete_one({"_id": candidate_id})
+
+def success_result(_id, apn, confidence, method):
+    return {
+        "id": str(_id),
+        "status": "enriched",
+        "apn": apn,
+        "confidence": confidence,
+        "method": method
+    }
+
 # ------------------- Row Processing -------------------
+
 def process_unified_row(row: Dict, db) -> Optional[Dict]:
     try:
         processed_row = {
             normalize_column_name(k): str(v).strip() if v is not None else ""
             for k, v in row.items()
         }
-
         mapped_row = {}
         for col_name, value in processed_row.items():
             canonical = map_column(col_name, REQUIRED_COLUMN_MAPPINGS) or \
                        map_column(col_name, OPTIONAL_COLUMN_MAPPINGS)
-            logger.debug(f"Original row: {row}")
-            logger.debug(f"Processed row: {processed_row}")
-            logger.debug(f"Mapped row: {mapped_row}")
-
             if canonical:
                 mapped_row[canonical] = value
-
-        apn = clean_apn(mapped_row.get("apn", ""))
-        if apn is None:
-            logger.warning(f"[Fallback] Invalid APN: {mapped_row.get('apn')}")
-            fallback_doc = {
+        raw_apn = mapped_row.get("apn", "")
+        apn = clean_apn(raw_apn)
+        if not raw_apn or not raw_apn.strip():
+            db.fallback_candidates.insert_one({
                 "raw_data": row,
-                "reason": "missing_or_invalid_apn",
+                "reason": "missing_apn",
                 "status": "pending",
                 "created_at": datetime.now(timezone.utc),
                 "source": "unified_csv"
-            }
-            db.fallback_candidates.insert_one(fallback_doc)
+            })
             return None
-
-
-
-
+        if not apn:
+            db.fallback_candidates.insert_one({
+                "raw_data": row,
+                "reason": "apn_not_numeric_or_too_short",
+                "status": "pending",
+                "created_at": datetime.now(timezone.utc),
+                "source": "unified_csv"
+            })
+            return None
+        property_zip = extract_best_zip(
+            processed_row, 
+            ["property zip 5", "property zip"]
+        )
+        if not property_zip:
+            db.fallback_candidates.insert_one({
+                "raw_data": row,
+                "reason": "invalid_property_zip",
+                "status": "pending",
+                "created_at": datetime.now(timezone.utc),
+                "source": "unified_csv"
+            })
+            return None
+        mailing_zip = extract_best_zip(
+            processed_row,
+            ["mailing zip 5", "mailing zip"]
+        )
+        if not mailing_zip:
+            db.fallback_candidates.insert_one({
+                "raw_data": row,
+                "reason": "invalid_mailing_zip",
+                "status": "pending",
+                "created_at": datetime.now(timezone.utc),
+                "source": "unified_csv"
+            })
+            return None
         if mapped_row.get("property state", "").strip().upper() != "WA":
             logger.info(f"Skipping non-WA property: {mapped_row.get('property state')}")
             return None
-
         normalized_owner_id = generate_owner_hash(
             mapped_row.get("first name", ""),
             mapped_row.get("last name", ""),
             mapped_row.get("mailing address", ""),
-            mapped_row.get("mailing zip", "")
+            mailing_zip
         )
         owner_id = f"OWN-{normalized_owner_id[:8]}"
-
         property_doc = {
             "apn": apn,
             "address": {
                 "street": mapped_row.get("property address", ""),
                 "city": mapped_row.get("property city", ""),
                 "state": mapped_row.get("property state", "").upper()[:2],
-                "zip": validate_zip(mapped_row.get("property zip", ""))
+                "zip": property_zip
             },
             "characteristics": {
                 "bedrooms": safe_int(mapped_row.get("bedrooms", "")),
@@ -259,8 +342,6 @@ def process_unified_row(row: Dict, db) -> Optional[Dict]:
                     emails.append(parsed.normalized)
                 except EmailNotValidError:
                     logger.warning(f"Invalid email format: {email}")
-
-
         owner_doc = {
             "owner_id": owner_id,
             "normalized_owner_id": normalized_owner_id,
@@ -270,7 +351,7 @@ def process_unified_row(row: Dict, db) -> Optional[Dict]:
                 "street": mapped_row.get("mailing address", ""),
                 "city": mapped_row.get("mailing city", ""),
                 "state": mapped_row.get("mailing state", "").upper()[:2],
-                "zip": validate_zip(mapped_row.get("mailing zip", ""))
+                "zip": mailing_zip
             },
             "emails": emails,
             "phone_ids": [],
@@ -278,7 +359,6 @@ def process_unified_row(row: Dict, db) -> Optional[Dict]:
             "status": mapped_row.get("status", "unknown").lower(),
             "last_updated": datetime.now(timezone.utc)
         }
-
         phone_docs = []
         for i in range(1, 31):
             phone = processed_row.get(f"phone {i}", "")
@@ -286,49 +366,37 @@ def process_unified_row(row: Dict, db) -> Optional[Dict]:
                 continue
             phone_number = clean_phone(phone)
             if phone_number:
-                logger.info(f"[Phone Found] {phone_number} from column: phone {i}")
                 phone_id_hash = hashlib.sha256(phone_number.encode()).hexdigest()[:8]
                 phone_id = f"PHONE-{phone_id_hash}"
                 phone_doc = {
                     "phone_id": phone_id,
                     "number": str(phone_number),
                     "linked_apns": [apn],
-                    "linked_owners": [owner_id], 
+                    "linked_owners": [owner_id],
                     "type": mapped_row.get(f"phone type {i}", "UNKNOWN").upper(),
                     "status": mapped_row.get(f"phone status {i}", "UNVERIFIED").upper(),
                     "tags": parse_array(mapped_row.get(f"phone tags {i}", "")),
                     "last_updated": datetime.now(timezone.utc)
                 }
-                logger.debug(f"Phone document prepared: {json.dumps(phone_doc, default=str)}")  # <-- NEW
                 phone_docs.append(phone_doc)
                 owner_doc["phone_ids"].append(phone_id)
-
-                # ========== LIFE EVENTS PROCESSING ==========
         known_life_event_fields = {
-            # Tax Events
             "tax auction date": "TAX_AUCTION",
             "tax delinquent value": "TAX_DELINQUENCY",
             "tax delinquent year": "TAX_DELINQUENCY",
             "year behind on taxes": "TAX_DELINQUENCY",
-            
-            # Legal Events
             "lien type": "LIEN",
             "lien recording date": "LIEN",
             "foreclosure date": "FORECLOSURE",
             "bankruptcy recording date": "BANKRUPTCY",
             "divorce file date": "DIVORCE",
-            
-            # Probate/Inheritance
             "probate open date": "PROBATE",
             "personal representative": "PROBATE",
             "attorney on file": "PROBATE",
-            
-            # Property Events
             "deed": "DEED_CHANGE",
             "last sold": "PROPERTY_SALE",
             "owned since": "OWNERSHIP_DURATION",
         }
-
         TAG_EVENT_PATTERNS = {
             r"skip traced (\w+) (\d{2}/\d{4})": "SKIP_TRACED",
             r"list purchased (\w+) (\d{2}/\d{4})": "LIST_PURCHASED",
@@ -339,16 +407,13 @@ def process_unified_row(row: Dict, db) -> Optional[Dict]:
             r"probate": "PROBATE",
             r"quit claim": "QUIT_CLAIM_DEED"
         }
-
         life_events = []
-        tags = owner_doc.get("tags", [])  # Get parsed tags array
-
-        # Process structured fields
+        sale_reasons = []  # Initialize sale_reasons
+        tags = owner_doc.get("tags", [])
         for field, event_type in known_life_event_fields.items():
             raw_value = mapped_row.get(field, "").strip()
             if not raw_value:
                 continue
-
             event = {
                 "apn": apn,
                 "event_type": event_type,
@@ -358,8 +423,6 @@ def process_unified_row(row: Dict, db) -> Optional[Dict]:
                 "notification_date": datetime.now(timezone.utc),
                 "last_updated": datetime.now(timezone.utc)
             }
-
-            # Date parsing
             if any(kw in field.lower() for kw in ["date", "year", "since"]):
                 try:
                     if re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", raw_value):
@@ -370,15 +433,9 @@ def process_unified_row(row: Dict, db) -> Optional[Dict]:
                         event["event_date"] = parse(raw_value)
                 except Exception as e:
                     logger.warning(f"Failed to parse date for {field}: {str(e)}")
-
             life_events.append(event)
-
-        # Process tags for life events
-        sale_reasons = []
         for tag in tags:
             tag_lower = tag.lower()
-            
-            # Pattern-based events
             for pattern, event_type in TAG_EVENT_PATTERNS.items():
                 if re.search(pattern, tag_lower):
                     event = {
@@ -389,8 +446,6 @@ def process_unified_row(row: Dict, db) -> Optional[Dict]:
                         "notification_date": datetime.now(timezone.utc),
                         "last_updated": datetime.now(timezone.utc)
                     }
-                    
-                    # Extract date from tag
                     date_match = re.search(r"(\d{2}/\d{4})", tag)
                     if date_match:
                         try:
@@ -399,19 +454,14 @@ def process_unified_row(row: Dict, db) -> Optional[Dict]:
                             )
                         except Exception as e:
                             logger.warning(f"Failed to parse date from tag: {tag} - {str(e)}")
-                    
                     life_events.append(event)
-                    break  # Stop checking patterns after first match
-
-            # Sale reason detection
+                    break
             if "tired landlords" in tag_lower:
                 sale_reasons.append("TIRED_LANDLORD")
             if "empty nesters" in tag_lower:
                 sale_reasons.append("EMPTY_NESTERS")
             if "high equity" in tag_lower:
                 sale_reasons.append("HIGH_EQUITY")
-
-            # Physical distress detection
             if any(indicator in tag_lower for indicator in ["poor condition", "fair condition"]):
                 life_events.append({
                     "apn": apn,
@@ -420,8 +470,6 @@ def process_unified_row(row: Dict, db) -> Optional[Dict]:
                     "notification_date": datetime.now(timezone.utc),
                     "last_updated": datetime.now(timezone.utc)
                 })
-
-        # Add aggregated sale reasons
         if sale_reasons:
             life_events.append({
                 "apn": apn,
@@ -431,21 +479,9 @@ def process_unified_row(row: Dict, db) -> Optional[Dict]:
                 "notification_date": datetime.now(timezone.utc),
                 "last_updated": datetime.now(timezone.utc)
             })
-
-        # Add physical distress detection
-        if any(indicator in tags for indicator in ["poor condition", "fair condition"]):
-            life_events.append({
-                "apn": apn,
-                "event_type": "PHYSICAL_DISTRESS",
-                "source": "Tag Analysis",
-                "notification_date": datetime.now(timezone.utc),
-                "last_updated": datetime.now(timezone.utc)
-            })
-
-
-        last_sold = mapped_row.get("last sold", "")
-        sale_price = mapped_row.get("last sale price", "")
-        if last_sold and sale_price:
+        last_sold = mapped_row.get("last sold", "").strip()
+        sale_price = mapped_row.get("last sale price", "").strip()
+        if last_sold and sale_price and last_sold.lower() not in ["none", "n/a", ""]:
             try:
                 sale_date = datetime.strptime(last_sold, "%Y-%m-%d %H:%M:%S")
                 property_doc["sale_history"] = [{
@@ -459,59 +495,41 @@ def process_unified_row(row: Dict, db) -> Optional[Dict]:
                     "date": sale_date,
                     "price": safe_float(sale_price)
                 }
-                # In process_unified_row()
-                logger.debug(f"Processing row with APN: {apn}")
-                logger.debug(f"Found emails: {emails}")
-                logger.debug(f"Found phones: {[p['number'] for p in phone_docs]}")
             except Exception as e:
                 logger.warning(f"Failed to parse last_sold date: {last_sold} — {str(e)}")
-
-
         return {
             "property": property_doc,
             "owner": owner_doc,
             "phones": phone_docs,
             "life_events": life_events
         }
-
     except Exception as e:
         logger.error(f"Row processing error: {str(e)}")
         return None
 
 def process_unified_batch(batch: List[Dict], db):
-    """Process a batch of rows"""
     prop_ops = []
     owner_ops = []
     phone_ops = []
     life_event_ops = []
-    errors = []  # Initialize errors as an empty list
-    
+    errors = []
     for row in batch:
         try:
             row_number = row.get("row_number", -1)
             raw_data = row.get("data", {})
-
             entities = process_unified_row(raw_data, db)
-
             if not entities:
                 continue
-
             if "error" in entities:
-                entities["error"]["row_number"] = row_number  # inject the row number here
+                entities["error"]["row_number"] = row_number
                 errors.append(entities["error"])
                 logger.warning(f"[Row {row_number}] Skipped: {entities['error']['message']}")
                 continue
-
-
-            # Now safe to access: entities["property"], entities["owner"], etc.
             prop_ops.append(UpdateOne(
                 {"apn": entities["property"]["apn"]},
                 {"$set": entities["property"]},
                 upsert=True
             ))
-
-            
-            # Owner insert
             owner_update = {
                 "$setOnInsert": {
                     "normalized_owner_id": entities["owner"]["normalized_owner_id"],
@@ -528,43 +546,21 @@ def process_unified_batch(batch: List[Dict], db):
                     "last_updated": entities["owner"]["last_updated"]
                 }
             }
-
-            # Add phone_ids to $addToSet without overwriting other fields
             if entities["owner"]["phone_ids"]:
                 owner_update["$addToSet"]["phone_ids"] = {"$each": entities["owner"]["phone_ids"]}
-
             owner_ops.append(UpdateOne(
                 {"normalized_owner_id": entities["owner"]["normalized_owner_id"]},
                 owner_update,
                 upsert=True
             ))
-            
-            
-            if not entities:
-                continue
-
-            if "error" in entities:
-                errors.append({
-                    "row": row.get("row_number", -1),
-                    "error_type": entities["error"]["error_type"],
-                    "message": entities["error"]["message"],
-                    "raw_data": entities["error"]["raw_data"]
-                })
-                continue
-
-
-
-            # Phone updates
             for phone in entities["phones"]:
                 if not all(key in phone for key in ["phone_id", "number"]):
                     logger.error(f"Invalid phone document: {phone}")
-                    continue  # Skip invalid entries
-
+                    continue
                 logger.info(f"[Mongo Upsert] Inserting phone: {phone['number']} (ID: {phone['phone_id']})")
                 phone_ops.append(UpdateOne(
                     {"number": str(phone["number"])},
                     {
-                        # Initialize fields only on insert
                         "$setOnInsert": {
                             "phone_id": phone["phone_id"],
                             "number": str(phone["number"]),
@@ -573,21 +569,16 @@ def process_unified_batch(batch: List[Dict], db):
                             "tags": phone.get("tags", []),
                             "created_at": phone["last_updated"]
                         },
-
-                        # Always update these fields
                         "$set": {
                             "last_updated": phone["last_updated"]
                         },
-                        # Safely merge arrays (works even if existing fields are invalid)
                         "$addToSet": {
-                            "linked_apns": { "$each": phone["linked_apns"] },
-                            "linked_owners": { "$each": phone["linked_owners"] }
+                            "linked_apns": {"$each": phone["linked_apns"]},
+                            "linked_owners": {"$each": phone["linked_owners"]}
                         }
                     },
                     upsert=True
                 ))
-            
-            # Life events
             for event in entities["life_events"]:
                 life_event_ops.append(UpdateOne(
                     {
@@ -611,11 +602,8 @@ def process_unified_batch(batch: List[Dict], db):
                     },
                     upsert=True
                 ))
-
         except Exception as e:
             logger.error(f"Batch processing error: {str(e)}")
-    
-    # Execute bulk writes
     results = {}
     try:
         if prop_ops:
@@ -643,10 +631,10 @@ def process_unified_batch(batch: List[Dict], db):
     except BulkWriteError as bwe:
         logger.error(f"Bulk write error: {bwe.details}")
         results["errors"] = bwe.details
-    
     return results
 
 # --- API Endpoints ---
+
 @app.post("/upload/unified", tags=["Data Ingestion"])
 async def upload_unified_csv(
     background_tasks: BackgroundTasks,
@@ -654,40 +642,31 @@ async def upload_unified_csv(
     db=Depends(get_db),
     api_key: str = Depends(api_key_header)
 ):
-    """Upload unified CSV file"""
     session_id = f"UNIFIED_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
-    
     try:
         content = await file.read()
         csv_file = io.TextIOWrapper(io.BytesIO(content), encoding="utf-8")
         reader = csv.DictReader(csv_file)
-        # In the upload_unified_csv endpoint, after reader = csv.DictReader(csv_file)
         logger.info(f"Raw CSV headers: {reader.fieldnames}")
         logger.info(f"Normalized headers: {[normalize_column_name(col) for col in reader.fieldnames]}")
         if not reader.fieldnames:
             raise HTTPException(status_code=400, detail="Empty CSV file")
-            
-        # Validate required columns
         missing_fields = {}
         received_columns = [normalize_column_name(col) for col in reader.fieldnames]
         logger.info(f"Normalized columns received: {received_columns}")
-
         for canonical, aliases in REQUIRED_COLUMN_MAPPINGS.items():
             if canonical == "apn":
-                found = "apn" in received_columns  # Only accept actual "apn"
+                found = "apn" in received_columns
             else:
                 found = any(
                     normalize_column_name(alias) in received_columns
                     for alias in aliases
                 )
-
-            
             if not found:
                 missing_fields[canonical] = {
                     "expected_aliases": aliases,
                     "received_columns": received_columns
                 }
-
         if missing_fields:
             error_details = {
                 "error_type": "validation_error",
@@ -705,35 +684,29 @@ async def upload_unified_csv(
                 },
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY
             )
-            
         background_tasks.add_task(
             process_unified_upload,
             content,
             session_id,
             db
         )
-        
         return {
             "status": "processing",
             "session_id": session_id,
             "filename": file.filename,
             "message": "Data is being processed in the background"
         }
-        
     except Exception as e:
         logger.error(f"Initial validation failed: {str(e)}")
         raise HTTPException(400, detail=str(e))
+
 def process_unified_upload(file_bytes: bytes, session_id: str, db):
-    """Background processing task for unified CSV uploads"""
     batch_size = 1000
     processed = 0
-    errors = [] 
-    
+    errors = []
     try:
         csv_file = io.TextIOWrapper(io.BytesIO(file_bytes), encoding="utf-8")
         reader = csv.DictReader(csv_file)
-        
-        # Initialize session tracking
         db.upload_sessions.update_one(
             {"upload_id": session_id},
             {"$set": {
@@ -747,21 +720,17 @@ def process_unified_upload(file_bytes: bytes, session_id: str, db):
             }},
             upsert=True
         )
-
-        # Process in batches
         batch = []
         for row_num, row in enumerate(reader, 1):
             try:
                 normalized_row = {
-                    "row_number": row_num,  # Add row number to context
+                    "row_number": row_num,
                     "data": {
                         normalize_column_name(k): str(v).strip() 
                         for k, v in row.items()
                     }
                 }
                 batch.append(normalized_row)
-                
-                # Process batch when size reached
                 if len(batch) >= batch_size:
                     result = process_unified_batch(batch, db)
                     processed += len(batch)
@@ -773,7 +742,6 @@ def process_unified_upload(file_bytes: bytes, session_id: str, db):
                         }}
                     )
                     batch = []
-                    
             except Exception as e:
                 errors.append({
                     "row": row_num,
@@ -781,14 +749,9 @@ def process_unified_upload(file_bytes: bytes, session_id: str, db):
                     "message": str(e),
                     "raw_data": {k: v for k, v in row.items() if k.lower() not in ['password', 'ssn']}
                 })
-
-
-        # Process final batch
         if batch:
             process_unified_batch(batch, db)
             processed += len(batch)
-
-        # Mark session as completed
         db.upload_sessions.update_one(
             {"upload_id": session_id},
             {"$set": {
@@ -796,10 +759,9 @@ def process_unified_upload(file_bytes: bytes, session_id: str, db):
                 "end_time": datetime.now(timezone.utc),
                 "processed_count": processed,
                 "error_count": len(errors),
-                "errors": errors[:1000]  # Store first 1000 errors
+                "errors": errors[:1000]
             }}
         )
-
     except Exception as e:
         logger.error(f"[{session_id}] Processing failed: {str(e)}")
         db.upload_sessions.update_one(
@@ -813,12 +775,9 @@ def process_unified_upload(file_bytes: bytes, session_id: str, db):
                 "errors": errors[:1000]
             }}
         )
-    finally:
-        # No need to close client here - connection is managed by app lifecycle
-        pass  
+
 @app.get("/properties/{apn}", tags=["Query"])
 def get_property(apn: str, db=Depends(get_db)):
-    """Get full property details with relationships"""
     pipeline = [
         {"$match": {"apn": clean_apn(apn)}},
         {"$lookup": {
@@ -849,29 +808,23 @@ def get_property(apn: str, db=Depends(get_db)):
             "phones": 1
         }}
     ]
-    
     result = list(db.properties.aggregate(pipeline))
     return json.loads(json_util.dumps(result))
 
 @app.get("/upload/sessions/{session_id}", tags=["System"])
 def get_upload_session(session_id: str, db=Depends(get_db)):
-    """Get upload session status"""
     session = db.upload_sessions.find_one(
         {"upload_id": session_id},
         {"_id": 0}
     )
     if not session:
         raise HTTPException(404, detail="Session not found")
-    
-    # Convert datetime to ISO string
     if 'timestamp' in session:
         session['timestamp'] = session['timestamp'].isoformat()
-    
     return session
 
 @app.get("/upload/requirements/unified", tags=["System"])
 async def get_unified_requirements():
-    """Get CSV column requirements"""
     return {
         "required_fields": REQUIRED_COLUMN_MAPPINGS,
         "optional_fields": OPTIONAL_COLUMN_MAPPINGS,
@@ -882,14 +835,11 @@ async def get_unified_requirements():
         ]
     }
 
-
 @app.get("/upload/sessions/{session_id}/report", tags=["Reporting"])
 def get_upload_summary_report(session_id: str, format: str = "json", db=Depends(get_db)):
-    """Download a summary report of a processed upload"""
     session = db.upload_sessions.find_one({"upload_id": session_id})
     if not session:
         raise HTTPException(status_code=404, detail="Upload session not found")
-
     report = {
         "upload_id": session.get("upload_id"),
         "collection": session.get("collection"),
@@ -900,51 +850,35 @@ def get_upload_summary_report(session_id: str, format: str = "json", db=Depends(
         "error_count": session.get("error_count", 0),
         "errors_summary": {}
     }
-
     for err in session.get("errors", []):
         key = err.get("error_type", "unknown")
         report["errors_summary"].setdefault(key, 0)
         report["errors_summary"][key] += 1
-
     if format == "csv":
-        from fastapi.responses import StreamingResponse
-        import csv
-        import io
-
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=report.keys())
         writer.writeheader()
         writer.writerow(report)
         output.seek(0)
         return StreamingResponse(output, media_type="text/csv")
-
     return report
-
 
 @app.get("/upload/sessions/{session_id}/error_rows.csv", tags=["Reporting"])
 def download_error_rows_csv(session_id: str, db=Depends(get_db)):
     session = db.upload_sessions.find_one({"upload_id": session_id})
     if not session or "errors" not in session:
         raise HTTPException(404, "No errors found")
-
-    # Get all error rows
-    all_errors = session["errors"][:1000]  # Adjust based on your storage limit
-    
-    # Extract CSV headers
+    all_errors = session["errors"][:1000]
     fieldnames = set()
     for error in all_errors:
         fieldnames.update(error["raw_data"].keys())
-
-    # Generate CSV
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=sorted(fieldnames))
     writer.writeheader()
-    
     for error in all_errors:
         writer.writerow({
             k: str(v) for k, v in error["raw_data"].items()
         })
-    
     output.seek(0)
     return StreamingResponse(
         output,
@@ -952,6 +886,166 @@ def download_error_rows_csv(session_id: str, db=Depends(get_db)):
         headers={"Content-Disposition": f"attachment; filename=errors_{session_id}.csv"}
     )
 
+@app.post("/fallback/enrich_missing_apn", tags=["Enrichment"])
+def enrich_missing_apns(limit: int = 10, db: Database = Depends(get_db)):
+    logger.info("🟢 /fallback/enrich_missing_apn POST hit")
+
+    # --- Configuration ---
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2
+    CONFIDENCE_THRESHOLD = 80
+    APIFY_TOKEN = os.getenv("APIFY_API_TOKEN")
+
+    # --- Metrics ---
+    metrics = {
+        "processed": 0,
+        "sources": {"local_db": 0, "google": 0, "apify": 0},
+        "durations": [],
+        "errors": [],
+        "errors_breakdown": {"timeout": 0, "captcha": 0, "no_apn_found": 0}
+    }
+
+    candidates = list(db.fallback_candidates.find({
+        "reason": {"$in": ["missing_apn", "apn_not_numeric_or_too_short"]},
+        "enrichment_status": {"$in": [None, "failed"]}
+    }).limit(limit))
+
+    results = []
+
+    def retry_wrapper(func, *args, label="", **kwargs):
+        for attempt in range(MAX_RETRIES):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                logger.warning(f"{label} attempt {attempt+1} failed: {str(e)}")
+                if "timeout" in str(e).lower():
+                    metrics["errors_breakdown"]["timeout"] += 1
+                elif "captcha" in str(e).lower():
+                    metrics["errors_breakdown"]["captcha"] += 1
+                if attempt == MAX_RETRIES - 1:
+                    raise
+                time.sleep(RETRY_DELAY * (attempt + 1))
+
+    for candidate in candidates:
+        start_time = time.time()
+        candidate_id = candidate["_id"]
+        raw_data = candidate.get("raw_data", {})
+        metrics["processed"] += 1
+        status = "failed"
+        apn = None
+
+        try:
+            raw_address = raw_data.get("property address", "").strip()
+            city = raw_data.get("property city", "").strip()
+            state = raw_data.get("property state", "").strip()
+            zip_code = raw_data.get("property zip", "").strip()
+
+            if not all([raw_address, city, state]):
+                raise ValueError("Missing address fields")
+
+            standardized = standardize_address(raw_address, city, state, zip_code)
+            full_address = f"{standardized['street']}, {standardized['city']}, {standardized['state']} {standardized['zip']}"
+
+            # --- Step 1: Local DB fuzzy match ---
+            try:
+                owner_name = f"{raw_data.get('first name', '')} {raw_data.get('last name', '')}".strip()
+                match, confidence = retry_wrapper(
+                    find_best_db_match,
+                    standardized['street'], owner_name, db,
+                    label="Local DB"
+                )
+                if confidence >= CONFIDENCE_THRESHOLD:
+                    apn = match["apn"]
+                    status = "enriched_via_local_db"
+                    metrics["sources"]["local_db"] += 1
+                    results.append(success_result(candidate_id, apn, confidence, "local_db"))
+                    move_out_of_fallback(apn, raw_data, db, candidate_id)
+                    continue
+            except Exception as e:
+                logger.info(f"No local DB match for {candidate_id}: {e}")
+
+            # --- Step 2: Google Scrape ---
+            search_term = f"{full_address} parcel number -site:zillow.com"
+            try:
+                apn = retry_wrapper(get_parcel_number, search_term, str(candidate_id), label="Google")
+                if apn:
+                    status = "enriched_via_google"
+                    metrics["sources"]["google"] += 1
+                    results.append(success_result(candidate_id, apn, None, "google"))
+                    move_out_of_fallback(apn, raw_data, db, candidate_id)
+                    continue
+            except Exception as e:
+                logger.warning(f"Google scraping failed for {candidate_id}: {e}")
+
+            # --- Step 3: Apify Backup ---
+            if APIFY_TOKEN:
+                try:
+                    apn = retry_wrapper(apify_general_scrape, full_address, APIFY_TOKEN, label="Apify")
+                    if apn:
+                        status = "enriched_via_apify"
+                        metrics["sources"]["apify"] += 1
+                        results.append(success_result(candidate_id, apn, None, "apify"))
+                        move_out_of_fallback(apn, raw_data, db, candidate_id)
+                        continue
+                except Exception as e:
+                    logger.warning(f"Apify scrape failed for {candidate_id}: {e}")
+
+            # --- All steps failed ---
+            logger.warning(f"No APN found for {candidate_id}")
+            metrics["errors_breakdown"]["no_apn_found"] += 1
+            results.append({
+                "id": str(candidate_id),
+                "status": "failed",
+                "apn": None,
+                "confidence": None
+            })
+
+        except Exception as e:
+            error_msg = f"💥 Critical error for {candidate_id}: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            metrics["errors"].append(error_msg)
+            results.append({
+                "id": str(candidate_id),
+                "status": "error",
+                "error": str(e),
+                "apn": None,
+                "confidence": None
+            })
+
+        finally:
+            try:
+                db.fallback_candidates.update_one(
+                    {"_id": candidate_id},
+                    {"$set": {
+                        "enrichment_attempted_at": datetime.now(timezone.utc),
+                        "enrichment_status": status,
+                        "processing_time": time.time() - start_time
+                    }}
+                )
+            except Exception as e:
+                logger.error(f"Failed to update candidate {candidate_id}: {str(e)}")
+            time.sleep(random.uniform(1, 3))
+
+    success_count = sum(metrics["sources"].values())
+    avg_time = sum(metrics["durations"]) / len(metrics["durations"]) if metrics["durations"] else 0
+    success_rate = (success_count / metrics["processed"] * 100) if metrics["processed"] else 0
+
+    logger.info(f"""
+    🔚 APN Enrichment Finished
+    --------------------------
+    Processed: {metrics["processed"]}
+    Success Rate: {success_rate:.1f}%
+    Source Breakdown: {metrics["sources"]}
+    Avg Time: {avg_time:.2f}s
+    Errors: {len(metrics["errors"])}
+    Error Breakdown: {metrics["errors_breakdown"]}
+    """)
+
+    return {
+        "processed_count": len(results),
+        "results": results,
+        "metrics": metrics
+    }
 
 @app.get("/", tags=["System"])
 def root():
@@ -968,19 +1062,15 @@ def root():
     }
 
 # --- Index Management ---
+
 @app.on_event("startup")
 async def startup_db_client():
-    """Initialize MongoDB connection and create indexes"""
     try:
-        # Create persistent client
         app.state.mongo_client = MongoClient(os.getenv("MONGO_URI"))
         app.state.db = app.state.mongo_client[os.getenv("DB_NAME", "RealEstate")]
-        
-        # Create indexes
         db = app.state.db
         if "upload_sessions" not in db.list_collection_names():
             db.create_collection("upload_sessions")
-        
         db.properties.create_index([("apn", 1)], unique=True, background=True)
         db.properties.create_index([("address.zip", 1)], background=True)
         db.owners.create_index([("apn", 1)], background=True)
@@ -989,38 +1079,28 @@ async def startup_db_client():
             [("number", pymongo.ASCENDING)],
             name="number_unique_ci",
             unique=True,
-            collation={"locale": "en", "strength": 2},  # Case-insensitive
+            collation={"locale": "en", "strength": 2},
             background=True
         )
         db.life_events.create_index([("apn", 1), ("event_type", 1)])
         db.life_events.create_index([("event_date", -1)])
-        
-                # --- NEW: fallback_candidates setup ---
         if "fallback_candidates" not in db.list_collection_names():
             db.create_collection("fallback_candidates")
             logger.info("Created 'fallback_candidates' collection.")
-
         db.fallback_candidates.create_index([("status", 1)], background=True)
         db.fallback_candidates.create_index([("reason", 1)], background=True)
         db.fallback_candidates.create_index([("created_at", -1)], background=True)
-
         logger.info("Database connection established and indexes verified")
-        
     except Exception as e:
         logger.error(f"Startup error: {str(e)}")
         raise
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    """Close MongoDB connection on shutdown"""
     if hasattr(app.state, "mongo_client"):
         app.state.mongo_client.close()
         logger.info("MongoDB connection closed")
 
-def get_db():
-    """Dependency to get database instance"""
-    return app.state.db
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000) 
