@@ -1,6 +1,10 @@
 {
     "linux64_chromedriver_134.0.6998.165_for_134.0.6998": {
-        "timestamp": "18/05/2025",
+        "timestamp": "22/05/2025",
         "binary_path": ".wdm/drivers/chromedriver/linux64/134.0.6998.165/chromedriver-linux64/chromedriver"
+    },
+    "linux64_chromedriver_129.0.6668.100_for_129.0.6668": {
+        "timestamp": "02/06/2025",
+        "binary_path": "/home/elisha-a/pvl/api/.wdm/drivers/chromedriver/linux64/129.0.6668.100/chromedriver-linux64/chromedriver"
     }
 }

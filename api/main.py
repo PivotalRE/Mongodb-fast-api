@@ -18,6 +18,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Backgroun
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from starlette import status
+from fastapi.responses import FileResponse
 
 from pymongo import MongoClient, UpdateOne
 from pymongo.database import Database
@@ -32,12 +33,13 @@ from dateutil.parser import parse
 from email_validator import validate_email, EmailNotValidError # type: ignore
 import requests
 import phonenumbers     # type: ignore
-
-# from utils.selenium_google import get_parcel_number
-from api.utils.selenium_google import get_parcel_number
-
+import tempfile
+import pandas as pd
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from scrapers.selenium_google import get_parcel_number
+from scrapers.kingCounty_Scraper import scrape_king_county_properties
+from scrapers.kingCounty_Scraper import scrape_from_mongo_and_update  # ensure it's implemented as shown before
 
 # Logging
 logger = logging.getLogger(__name__)
@@ -889,7 +891,7 @@ def download_error_rows_csv(session_id: str, db=Depends(get_db)):
     )
 
 @app.post("/fallback/enrich_missing_apn", tags=["Enrichment"])
-def enrich_missing_apns(limit: int = 10, db: Database = Depends(get_db)):
+def enrich_missing_apns(limit: int = 10, skip_already_enriched: bool = True, db: Database = Depends(get_db)):
     logger.info("🟢 /fallback/enrich_missing_apn POST hit")
 
     # --- Configuration ---
@@ -907,11 +909,14 @@ def enrich_missing_apns(limit: int = 10, db: Database = Depends(get_db)):
         "errors_breakdown": {"timeout": 0, "captcha": 0, "no_apn_found": 0}
     }
 
-    candidates = list(db.fallback_candidates.find({
-        "reason": {"$in": ["missing_apn", "apn_not_numeric_or_too_short"]},
-        "enrichment_status": {"$in": [None, "failed"]}
-    }).limit(limit))
+    # --- Query Candidates ---
+    match_filter = {
+        "reason": {"$in": ["missing_apn", "apn_not_numeric_or_too_short"]}
+    }
+    if skip_already_enriched:
+        match_filter["enrichment_status"] = {"$in": [None, "failed"]}
 
+    candidates = list(db.fallback_candidates.find(match_filter).limit(limit))
     results = []
 
     def retry_wrapper(func, *args, label="", **kwargs):
@@ -935,6 +940,8 @@ def enrich_missing_apns(limit: int = 10, db: Database = Depends(get_db)):
         metrics["processed"] += 1
         status = "failed"
         apn = None
+        method = None
+        confidence = None
 
         try:
             raw_address = raw_data.get("property address", "").strip()
@@ -958,9 +965,10 @@ def enrich_missing_apns(limit: int = 10, db: Database = Depends(get_db)):
                 )
                 if confidence >= CONFIDENCE_THRESHOLD:
                     apn = match["apn"]
+                    method = "local_db"
                     status = "enriched_via_local_db"
                     metrics["sources"]["local_db"] += 1
-                    results.append(success_result(candidate_id, apn, confidence, "local_db"))
+                    results.append(success_result(candidate_id, apn, confidence, method))
                     move_out_of_fallback(apn, raw_data, db, candidate_id)
                     continue
             except Exception as e:
@@ -971,9 +979,10 @@ def enrich_missing_apns(limit: int = 10, db: Database = Depends(get_db)):
             try:
                 apn = retry_wrapper(get_parcel_number, search_term, str(candidate_id), label="Google")
                 if apn:
+                    method = "google"
                     status = "enriched_via_google"
                     metrics["sources"]["google"] += 1
-                    results.append(success_result(candidate_id, apn, None, "google"))
+                    results.append(success_result(candidate_id, apn, None, method))
                     move_out_of_fallback(apn, raw_data, db, candidate_id)
                     continue
             except Exception as e:
@@ -984,9 +993,10 @@ def enrich_missing_apns(limit: int = 10, db: Database = Depends(get_db)):
                 try:
                     apn = retry_wrapper(apify_general_scrape, full_address, APIFY_TOKEN, label="Apify")
                     if apn:
+                        method = "apify"
                         status = "enriched_via_apify"
                         metrics["sources"]["apify"] += 1
-                        results.append(success_result(candidate_id, apn, None, "apify"))
+                        results.append(success_result(candidate_id, apn, None, method))
                         move_out_of_fallback(apn, raw_data, db, candidate_id)
                         continue
                 except Exception as e:
@@ -1015,18 +1025,30 @@ def enrich_missing_apns(limit: int = 10, db: Database = Depends(get_db)):
             })
 
         finally:
+            duration = time.time() - start_time
+            metrics["durations"].append(duration)
             try:
                 db.fallback_candidates.update_one(
                     {"_id": candidate_id},
-                    {"$set": {
-                        "enrichment_attempted_at": datetime.now(timezone.utc),
-                        "enrichment_status": status,
-                        "processing_time": time.time() - start_time
-                    }}
+                    {
+                        "$set": {
+                            "enrichment_attempted_at": datetime.now(timezone.utc),
+                            "enrichment_status": status,
+                            "enrichment_method": method,
+                            "enrichment_apn": apn,
+                            "enrichment_confidence": confidence,
+                            "processing_time": duration
+                        }
+                    }
                 )
             except Exception as e:
                 logger.error(f"Failed to update candidate {candidate_id}: {str(e)}")
             time.sleep(random.uniform(1, 3))
+
+        # Optional: intermediate logging for large batches
+        if metrics["processed"] % 5 == 0:
+            logger.info(f"Progress: {metrics['processed']} processed, "
+                        f"{sum(metrics['sources'].values())} successful so far.")
 
     success_count = sum(metrics["sources"].values())
     avg_time = sum(metrics["durations"]) / len(metrics["durations"]) if metrics["durations"] else 0
@@ -1046,8 +1068,79 @@ def enrich_missing_apns(limit: int = 10, db: Database = Depends(get_db)):
     return {
         "processed_count": len(results),
         "results": results,
-        "metrics": metrics
+        "metrics": metrics,
+        "summary": {
+            "success_rate": round(success_rate, 1),
+            "google_wins": metrics["sources"]["google"],
+            "db_wins": metrics["sources"]["local_db"],
+            "apify_wins": metrics["sources"]["apify"],
+            "errors": len(metrics["errors"]),
+            "average_time_sec": round(avg_time, 2)
+        }
     }
+
+
+@app.post("/scrape/kingcounty/json", tags=["Scraping"])
+async def scrape_kingcounty_json(file: UploadFile = File(...)) -> List[dict]:
+    try:
+        # Save uploaded file to a temporary path
+        temp_input = os.path.join(tempfile.gettempdir(), file.filename)
+        with open(temp_input, "wb") as f:
+            f.write(await file.read())
+
+        # Output file path
+        temp_output = os.path.join(tempfile.gettempdir(), f"scraped_{file.filename}")
+
+        # Run the scraper
+        scrape_king_county_properties(temp_input, temp_output)
+
+        # Load and return results as JSON
+        df = pd.read_csv(temp_output)
+        return df.to_dict(orient="records")
+
+    except Exception as e:
+        logging.error(f"King County scraping failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Scraper failed: " + str(e))
+    
+
+@app.post("/scrape/kingcounty/mongo", tags=["Scraping"])
+def scrape_kingcounty_from_mongo(
+    limit: int = 10,
+    db: Database = Depends(get_db)
+):
+    """
+    Scrapes King County property data for existing properties in MongoDB using their APNs.
+    Stores results into each document under `scraped_data`.
+    """
+    try:
+        mongo_uri = os.getenv("MONGO_URI")
+        db_name = os.getenv("DB_NAME", "RealEstate")
+        collection_name = "properties"
+
+        if not mongo_uri:
+            raise HTTPException(status_code=500, detail="MONGO_URI not configured")
+
+        scrape_from_mongo_and_update(
+            mongo_uri=mongo_uri,
+            db_name=db_name,
+            collection_name=collection_name,
+            limit=limit
+        )
+
+        return {
+            "status": "completed",
+            "message": f"Scraping finished for up to {limit} properties."
+        }
+
+    except Exception as e:
+        logger.error(f"KingCounty Mongo scraping failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Mongo-based scrape failed: " + str(e))
+
+@app.post("/enrich/violations", tags=["Enrichment"])
+def enrich_violations(limit: int = 50, db=Depends(get_db)):
+    from scrapers.code_violation import enrich_seattle_violations
+    return enrich_seattle_violations(limit=limit)
+
 
 @app.get("/", tags=["System"])
 def root():
@@ -1069,7 +1162,7 @@ def root():
 async def startup_db_client():
     try:
         app.state.mongo_client = MongoClient(os.getenv("MONGO_URI"))
-        app.state.db = app.state.mongo_client[os.getenv("DB_NAME", "RealEstate")]
+        app.state.db = app.state.mongo_client[os.getenv("DB_NAME", "PivotalRealEstate")]
         db = app.state.db
         if "upload_sessions" not in db.list_collection_names():
             db.create_collection("upload_sessions")
@@ -1105,4 +1198,4 @@ async def shutdown_db_client():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    uvicorn.run(app, host="0.0.0.0", port=8000)

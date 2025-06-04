@@ -1,0 +1,3 @@
+2025-05-29 17:42:50,093 - INFO - Loaded 5 records from /home/elisha-a/pvl/api/sample (1).xlsx
+2025-05-29 17:42:50,094 - CRITICAL - Driver initialization failed: ChromeDriverManager.__init__() got an unexpected keyword argument 'version'
+2025-05-29 17:42:50,094 - CRITICAL - Driver initialization failed: ChromeDriverManager.__init__() got an unexpected keyword argument 'version'
