@@ -1151,7 +1151,13 @@ def root():
             "upload": "/upload/unified",
             "status": "/upload/sessions/{session_id}",
             "requirements": "/upload/requirements/unified",
-            "property lookup": "/properties/{apn}"
+            "summary_report": "/upload/sessions/{session_id}/report",
+            "error_rows": "/upload/sessions/{session_id}/error_rows.csv",
+            "property_lookup": "/properties/{apn}",
+            "enrich_missing_apn": "/fallback/enrich_missing_apn",
+            "scrape_kingcounty_json": "/scrape/kingcounty/json",
+            "scrape_kingcounty_mongo": "/scrape/kingcounty/mongo",
+            "enrich_violations": "/enrich/violations"
         },
         "docs": "/docs"
     }
