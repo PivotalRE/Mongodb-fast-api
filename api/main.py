@@ -1137,10 +1137,9 @@ def scrape_kingcounty_from_mongo(
         raise HTTPException(status_code=500, detail="Mongo-based scrape failed: " + str(e))
 
 @app.post("/enrich/violations", tags=["Enrichment"])
-def enrich_violations(limit: int = 50, db=Depends(get_db)):
-    from scrapers.code_violation import enrich_seattle_violations
+def enrich_violations(limit: int = 50):
+    from api.scrapers.code_violation import enrich_seattle_violations  # type: ignore
     return enrich_seattle_violations(limit=limit)
-
 
 @app.get("/", tags=["System"])
 def root():
