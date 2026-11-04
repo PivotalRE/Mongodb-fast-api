@@ -7,6 +7,8 @@ COPY property-agent/pyproject.toml property-agent/README.md ./
 COPY property-agent/src ./src
 RUN pip install --no-cache-dir .
 COPY property-agent/agent_app ./agent_app
+# So an old start command, `uvicorn api.main:app`, also starts the agent.
+COPY property-agent/railway_compat/api ./api
 
 RUN useradd --create-home agent
 USER agent
