@@ -2,7 +2,11 @@
 
 ## 1. Railway (once)
 
-This folder sits in the `PivotalRE/Mongodb-fast-api` repo, next to the old prospecting API. It runs as its **own** Railway service, so the old API is not touched.
+This folder sits in the `PivotalRE/Mongodb-fast-api` repo, next to the old prospecting API.
+
+**Quickest way (what's set up now):** the repo's root `Dockerfile` builds this agent, so the existing Railway service for the repo runs it, on port 8000 as before. The old MongoDB API is not run for now; its build file is kept as `Dockerfile.mongo-api`. On that service you only add the variables from step 3.
+
+**Separate service instead (later, if the old API comes back):**
 
 1. In the Railway project: **New → GitHub Repo → PivotalRE/Mongodb-fast-api**.
 2. In the new service, open **Settings → Source**:

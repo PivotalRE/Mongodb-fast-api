@@ -1,5 +1,11 @@
 __pycache__/
+**/__pycache__/
 .venv/
+**/.venv/
 .vscode/
 .dockerignore
 .git
+**/.env
+**/.pytest_cache/
+property-agent/tests/
+property-agent/agent_app/result_*.json
